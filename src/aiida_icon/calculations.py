@@ -17,7 +17,7 @@ from aiida.parsers import parser
 from typing_extensions import Self
 
 from aiida_icon import builder, calcutils, exceptions
-from aiida_icon.iconutils import masternml, modelnml
+from aiida_icon.iconutils import masternml, modelnml, validation
 
 if typing.TYPE_CHECKING:
     from aiida.engine.processes import builder as process_builder
@@ -62,7 +62,7 @@ class IconCalculation(engine.CalcJob):
         spec.input("rrtmg_sw", valid_type=orm.RemoteData, required=False)
         spec.input("rrtmg_lw", valid_type=orm.RemoteData, required=False)
         spec.input_namespace(
-            "link_paths",
+            "link_path",
             valid_type=orm.RemoteData,
             dynamic=True,
             required=False,
@@ -140,6 +140,9 @@ class IconCalculation(engine.CalcJob):
         model_namelist_data = calcutils.collect_model_nml(self.inputs, download=True, strict=False, logger=self.logger)
         master_namelist_data = f90nml.reads(self.inputs.master_namelist.get_content(mode="r"))
 
+        # Validate configuration for common issues
+        validation.validate_icon_configuration(master_namelist_data, model_namelist_data, logger=self.logger)
+
         for stream_info in modelnml.read_output_stream_infos(model_namelist_data):
             folder.get_subfolder(stream_info.path, create=True)
 
@@ -208,8 +211,8 @@ class IconCalculation(engine.CalcJob):
                         ),
                     )
                 )
-        if "link_paths" in self.inputs:
-            for remotedata in self.inputs.link_paths.values():
+        if "link_path" in self.inputs:
+            for remotedata in self.inputs.link_path.values():
                 calcinfo.remote_symlink_list.append(
                     calcutils.make_remote_path_triplet(remotedata),
                 )
@@ -343,28 +346,42 @@ class IconParser(parser.Parser):
     """Parser for raw Icon calculations."""
 
     def parse(self, **kwargs):  # noqa: ARG002  # kwargs must be there for superclass compatibility
+        self.logger.debug("Starting parsing of ICON calculation outputs...")
+
         finish_status = self.parse_finish_status()
+        self.logger.debug("Finish status: %s", finish_status.status.name)
         if finish_status.message:
             self.out("finish_status", finish_status.message)
 
-        restart_indicated = finish_status is FinishStatus.RESTART or masternml.read_lrestart_write_last(
+        restart_indicated = finish_status.status is FinishStatus.RESTART or masternml.read_lrestart_write_last(
             self.node.inputs.master_namelist
         )
+        self.logger.debug("Restart files expected: %s", restart_indicated)
         restarts = self.parse_restart_files(restart_indicated=restart_indicated)
         for model_name, restart_result in restarts.items():
             if restart_result.all_restarts:
                 self.out(f"all_restart_files.{model_name}", restart_result.all_restarts)
+                self.logger.debug(
+                    "Output %d restart file(s) for model '%s'", len(restart_result.all_restarts), model_name
+                )
             if restart_result.latest_restart:
                 self.out(f"latest_restart_file.{model_name}", restart_result.latest_restart)
 
         restart_status = worst_restart_status(res.status for res in restarts.values())
+        self.logger.debug("Overall restart status: %s", restart_status.name)
 
         # Parse output streams
         try:
             output_streams = self.parse_output_streams()
             if output_streams:
                 self.out("output_streams", output_streams)
+            else:
+                self.logger.debug("No output streams were found or parsed.")
         except OSError:
+            self.logger.exception(
+                "Failed to parse output streams due to OSError: %s. "
+                "This usually means expected output directories or files are missing.",
+            )
             return self.exit_codes.PARTIALLY_PARSED
 
         match finish_status.status:
@@ -372,14 +389,24 @@ class IconParser(parser.Parser):
                 pass
             case FinishStatus.RESTART:
                 if restart_status is not RestartStatus.OK:
+                    self.logger.error(
+                        "ICON indicated RESTART status but restart files could not be properly parsed. "
+                        "Restart status: %s. Check earlier log messages for details about missing restart files.",
+                        restart_status,
+                    )
                     return self.exit_codes.PARTIALLY_PARSED
             case FinishStatus.UNEXPECTED:
+                self.logger.error(
+                    "ICON finished with an unexpected status (not 'OK' or 'RESTART'). "
+                    "Check the 'finish_status' output node for the actual status value."
+                )
                 return self.exit_codes.PARTIALLY_PARSED
             case FinishStatus.ERR_READING_STATUS:
                 return self.exit_codes.ERROR_READING_STATUS_FILE
             case FinishStatus.ERR_MISSING_STATUS:
                 return self.exit_codes.ERROR_MISSING_OUTPUT_FILES
 
+        self.logger.debug("Parsing completed successfully.")
         return engine.ExitCode(0)
 
     def parse_finish_status(self) -> FinishStatusResult:
@@ -412,11 +439,15 @@ class IconParser(parser.Parser):
         try:
             _ = remote_folder.computer.get_authinfo(user=orm.User.collection.get_default())
         except aiidaxc.NotExistent:
-            self.logger.info("Can not parse restart file names: not possible to authenticate to the computer")
+            self.logger.debug("Can not parse restart file names: not possible to authenticate to the computer")
             return results
 
         masternml_data = f90nml.reads(self.node.inputs.master_namelist.get_content(mode="r"))
-        for model_name, _ in masternml.iter_model_name_filepath(masternml_data):
+        model_list = list(masternml.iter_model_name_filepath(masternml_data))
+        self.logger.debug("Parsing restart files for %d model(s)...", len(model_list))
+
+        for model_name, _ in model_list:
+            self.logger.debug("Parsing restart files for model: %s", model_name)
             results[model_name] = self.parse_restart_files_for_model(
                 model_name=model_name, restart_indicated=restart_indicated
             )
@@ -440,9 +471,15 @@ class IconParser(parser.Parser):
                 model_name,
                 model_nml=modelnml_data,
             )
+            self.logger.debug(
+                "Looking for restart files for model '%s': pattern='%s', latest='%s'",
+                model_name,
+                all_restarts_pattern,
+                latest_restart_name,
+            )
 
         except exceptions.SinglefileRestartNotImplementedError:
-            self.logger.info("Can not parse restart file names, singlefile mode is not supported.")
+            self.logger.debug("Can not parse restart file names, singlefile mode is not supported.")
             if restart_indicated:
                 result.status = RestartStatus.ERROR
         except exceptions.RemoteModelNamelistInaccessibleError:
@@ -457,16 +494,32 @@ class IconParser(parser.Parser):
                     computer=self.node.computer,
                     remote_path=str(remote_path / file_name),
                 )
+                self.logger.debug("Found restart file for model '%s': %s", model_name, file_name)
             if file_name == latest_restart_name:
                 result.latest_restart = orm.RemoteData(
                     computer=self.node.computer,
                     remote_path=str(remote_path / file_name),
                 )
+                self.logger.debug("Found latest restart file for model '%s': %s", model_name, file_name)
 
         if result.all_restarts and result.latest_restart:
             result.status = RestartStatus.OK
+        elif restart_indicated:
+            self.logger.warning(
+                "Could not find a valid set of restart files for model '%s'. "
+                "Expected pattern: '%s', latest file: '%s'. "
+                "Found %d restart file(s), latest_restart=%s",
+                model_name,
+                all_restarts_pattern,
+                latest_restart_name,
+                len(result.all_restarts),
+                "found" if result.latest_restart else "missing",
+            )
         else:
-            self.logger.info("Could not find a valid set of restart files.")
+            self.logger.debug(
+                "No restart files found for model '%s' (not expected based on configuration).",
+                model_name,
+            )
 
         return result
 
@@ -503,7 +556,15 @@ class IconParser(parser.Parser):
 
         # Create RemoteData nodes for each output directory
         modelnml_data = calcutils.collect_model_nml(self.node.get_builder_restart())
-        for stream_info in modelnml.read_output_stream_infos(modelnml_data):
+        stream_infos = list(modelnml.read_output_stream_infos(modelnml_data))
+
+        if not stream_infos:
+            self.logger.debug("No output streams found in model namelist.")
+            return output_streams
+
+        self.logger.debug("Found %d output stream(s) in model namelist, parsing...", len(stream_infos))
+
+        for stream_info in stream_infos:
             stream_key = self._create_stream_key(stream_info)
             full_output_path = remote_base_path / stream_info.path
 
@@ -512,6 +573,12 @@ class IconParser(parser.Parser):
                 remote_path=str(full_output_path),
             )
 
-            self.logger.info("Registered output stream '%s' -> %s", stream_key, full_output_path)
+            self.logger.debug(
+                "Registered output stream '%s' -> %s (from stream_index=%d, path='%s')",
+                stream_key,
+                full_output_path,
+                stream_info.stream_index,
+                stream_info.path,
+            )
 
         return output_streams

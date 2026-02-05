@@ -89,7 +89,7 @@ def test_prepare_arbitrary_links(icon_builder, tmp_path, datapath):
         datapath.absolute() / "simple_icon_run" / "inputs" / "icon_master.namelist"
     )
     icon_builder.models.atm = orm.SinglefileData(datapath.absolute() / "simple_icon_run" / "inputs" / "model.namelist")
-    icon_builder.link_paths.foo = orm.RemoteData(
+    icon_builder.link_path.foo = orm.RemoteData(
         str(datapath.absolute() / "arbitrary_links" / "dir"), computer=icon_builder.code.computer
     )
     icon_builder.link_dir_contents.bar = orm.RemoteData(
