@@ -5,6 +5,8 @@ import typing
 import aiida
 import aiida.engine
 
+aiida.load_profile()
+
 from aiida_icon.calculations import IconCalculation
 
 if typing.TYPE_CHECKING:
@@ -18,8 +20,17 @@ class Icon(aiida.engine.BaseRestartWorkChain):
     @classmethod
     def define(cls: type[Self], spec: WorkChainSpec) -> None:  # type: ignore[override] # aiida-core and plumpy disagree
         super().define(spec)
-        spec.inputs["on_unhandled_failure"].default = "pause"  # type: ignore[union-attr] # .default might be added by metaprog
-        spec.expose_inputs(IconCalculation)
+        spec.inputs["on_unhandled_failure"].default = aiida.orm.Str("pause")  # type: ignore[union-attr] # .default might be added by metaprog
+        # spec.inputs["on_unhandled_failure"].default = "pause"  # type: ignore[union-attr] # .default might be added by metaprog
+        # spec.input(
+        #     "on_unhandled_failure",
+        #     valid_type=str,
+        #     default="pause",
+        #     required=False,
+        #     help='Overwrite `on_unhandled_failure` input',
+        # )
+
+        spec.expose_inputs(IconCalculation, namespace='icon')
         spec.expose_outputs(IconCalculation)
         spec.outline(
             cls.setup,  # type: ignore[arg-type] # inadequate type hints in aiida-core
@@ -32,4 +43,4 @@ class Icon(aiida.engine.BaseRestartWorkChain):
 
     def setup(self: Self) -> None:
         super().setup()
-        self.ctx.inputs = self.exposed_inputs(IconCalculation)
+        self.ctx.inputs = self.exposed_inputs(IconCalculation, "icon")
