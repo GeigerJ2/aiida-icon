@@ -548,7 +548,7 @@ class IconParser(parser.Parser):
 
     def parse_output_streams(self) -> dict[str, orm.RemoteData]:
         """Parse output streams from the model namelist and create RemoteData nodes."""
-        output_streams = {}
+        output_streams: dict[str, orm.RemoteData] = {}
 
         # Get the remote folder where outputs are stored
         remote_folder = typing.cast("orm.RemoteData", self.node.outputs.remote_folder)
